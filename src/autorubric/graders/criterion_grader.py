@@ -454,7 +454,7 @@ class CriterionGrader(Grader):
                 FewShotExample(
                     submission=item.submission,
                     verdict=item.ground_truth[criterion_idx],  # type: ignore
-                    reason=None,
+                    reason=item.reason[criterion_idx] if item.reason is not None else None,
                 )
                 for item in all_items[:n_examples]
             ]
@@ -524,7 +524,7 @@ class CriterionGrader(Grader):
             transform=lambda item: FewShotExample(
                 submission=item.submission,
                 verdict=item.ground_truth[criterion_idx],  # type: ignore
-                reason=None,
+                reason=item.reason[criterion_idx] if item.reason is not None else None,
             ),
             identity=lambda item: item.submission,
         )
@@ -587,7 +587,11 @@ class CriterionGrader(Grader):
                 groups=sorted_groups,
                 n_examples=n_examples,
                 rng=rng,
-                transform=lambda pair: (pair[0].submission, pair[1], None),
+                transform=lambda pair: (
+                    pair[0].submission,
+                    pair[1],
+                    pair[0].reason[criterion_idx] if pair[0].reason is not None else None,
+                ),
                 identity=lambda pair: pair[0].submission,
             )
         else:
@@ -598,7 +602,11 @@ class CriterionGrader(Grader):
             ]
             rng.shuffle(all_pairs)
             return [
-                (item.submission, resolved_idx, None)
+                (
+                    item.submission,
+                    resolved_idx,
+                    item.reason[criterion_idx] if item.reason is not None else None,
+                )
                 for item, resolved_idx in all_pairs[:n_examples]
             ]
 

@@ -31,6 +31,12 @@ class DataItem:
             - For binary criteria: CriterionVerdict (MET, UNMET, CANNOT_ASSESS)
             - For multi-choice criteria: str (option label)
             Used for computing evaluation metrics against LLM predictions.
+        reason: Optional list of reason/explanation strings, one per criterion,
+            parallel to ground_truth. When this item is selected as a few-shot
+            example (via CriterionGrader's training_data), reason[i] is shown to
+            the judge alongside the ground_truth[i] verdict/label, if
+            FewShotConfig.include_reason is True. None entries are allowed
+            per-criterion (that criterion's example is shown without a reason).
         rubric: Optional per-item rubric. If provided, this rubric is used for grading
             instead of the dataset-level rubric. Useful for datasets where each item
             has unique evaluation criteria (e.g., ResearcherBench).
@@ -65,6 +71,7 @@ class DataItem:
     submission: str
     description: str
     ground_truth: list[CriterionVerdict | str] | None = None
+    reason: list[str | None] | None = None
     rubric: Rubric | None = None
     reference_submission: str | None = None
     prompt: str | None = None
@@ -82,6 +89,20 @@ class DataItem:
             if self.rubric is not None and len(self.ground_truth) != len(self.rubric.rubric):
                 raise ValueError(
                     f"Ground truth has {len(self.ground_truth)} values, "
+                    f"but item rubric has {len(self.rubric.rubric)} criteria"
+                )
+        if self.reason is not None:
+            for v in self.reason:
+                if v is not None and not isinstance(v, str):
+                    raise ValueError(f"Reason values must be str or None, got {type(v).__name__}")
+            if self.ground_truth is not None and len(self.reason) != len(self.ground_truth):
+                raise ValueError(
+                    f"Reason has {len(self.reason)} values, "
+                    f"but ground_truth has {len(self.ground_truth)} values"
+                )
+            if self.rubric is not None and len(self.reason) != len(self.rubric.rubric):
+                raise ValueError(
+                    f"Reason has {len(self.reason)} values, "
                     f"but item rubric has {len(self.rubric.rubric)} criteria"
                 )
 
@@ -146,6 +167,11 @@ class RubricDataset:
             ):
                 raise ValueError(
                     f"Item {i} has {len(item.ground_truth)} ground truth values, "
+                    f"but rubric has {len(effective_rubric.rubric)} criteria"
+                )
+            if item.reason is not None and len(item.reason) != len(effective_rubric.rubric):
+                raise ValueError(
+                    f"Item {i} has {len(item.reason)} reason values, "
                     f"but rubric has {len(effective_rubric.rubric)} criteria"
                 )
 
@@ -282,6 +308,7 @@ class RubricDataset:
         submission: str,
         description: str,
         ground_truth: list[CriterionVerdict | str] | None = None,
+        reason: list[str | None] | None = None,
         rubric: Rubric | None = None,
         reference_submission: str | None = None,
         prompt: str | None = None,
@@ -294,14 +321,17 @@ class RubricDataset:
             ground_truth: Optional list of ground truth values.
                 - For binary criteria: CriterionVerdict (MET, UNMET, CANNOT_ASSESS)
                 - For multi-choice criteria: str (option label)
+            reason: Optional list of reason/explanation strings, one per criterion,
+                parallel to ground_truth. Surfaced in the few-shot prompt when this
+                item is selected as an example and FewShotConfig.include_reason=True.
             rubric: Optional per-item rubric. If None, uses global rubric.
             reference_submission: Optional exemplar response for grading context.
             prompt: Optional per-item prompt. If None, uses global prompt.
 
         Raises:
-            ValueError: If ground_truth length doesn't match effective rubric criteria count,
-                or if neither per-item nor global rubric is available, or if neither
-                per-item nor global prompt is available.
+            ValueError: If ground_truth or reason length doesn't match effective rubric
+                criteria count, or if neither per-item nor global rubric is available,
+                or if neither per-item nor global prompt is available.
         """
         if prompt is None and self.prompt is None:
             raise ValueError(
@@ -311,6 +341,7 @@ class RubricDataset:
             submission=submission,
             description=description,
             ground_truth=ground_truth,
+            reason=reason,
             rubric=rubric,
             reference_submission=reference_submission,
             prompt=prompt,
@@ -323,6 +354,11 @@ class RubricDataset:
         if item.ground_truth is not None and len(item.ground_truth) != len(effective_rubric.rubric):
             raise ValueError(
                 f"Ground truth has {len(item.ground_truth)} values, "
+                f"but rubric has {len(effective_rubric.rubric)} criteria"
+            )
+        if item.reason is not None and len(item.reason) != len(effective_rubric.rubric):
+            raise ValueError(
+                f"Reason has {len(item.reason)} values, "
                 f"but rubric has {len(effective_rubric.rubric)} criteria"
             )
         self.items.append(item)
@@ -405,6 +441,9 @@ class RubricDataset:
                 item_data["ground_truth"] = gt_values
             else:
                 item_data["ground_truth"] = None
+            # Serialize per-item reason if present
+            if item.reason is not None:
+                item_data["reason"] = item.reason
             # Serialize per-item rubric if present
             if item.rubric is not None:
                 item_data["rubric"] = self._serialize_rubric(item.rubric)
@@ -519,6 +558,9 @@ class RubricDataset:
                                 f"Must be 'MET', 'UNMET', or 'CANNOT_ASSESS'."
                             ) from None
 
+            # Parse per-item reason if present
+            reason = item_data.get("reason")
+
             # Parse per-item reference_submission if present
             item_reference = item_data.get("reference_submission")
             # Parse per-item prompt if present
@@ -529,6 +571,7 @@ class RubricDataset:
                     submission=submission,
                     description=description,
                     ground_truth=ground_truth,
+                    reason=reason,
                     rubric=item_rubric,
                     reference_submission=item_reference,
                     prompt=item_prompt,

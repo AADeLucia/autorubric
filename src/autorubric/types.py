@@ -1045,8 +1045,10 @@ class FewShotConfig:
             (MET/UNMET/CANNOT_ASSESS) for binary criteria, option indices for multi-choice
             criteria. If False, randomly sample without balancing. (The name is historical; the
             balancing logic is class-agnostic and applies to both criterion types.)
-        include_reason: If True, include the reason/explanation in examples.
-            Note: Ground truth datasets typically don't have reasons.
+        include_reason: If True, include each example's reason/explanation (from
+            DataItem.reason, per-criterion) in the assembled few-shot prompt, when
+            present. Has no effect for examples whose DataItem.reason is None/unset
+            for that criterion.
         seed: Random seed for reproducible sampling.
 
     Example:
