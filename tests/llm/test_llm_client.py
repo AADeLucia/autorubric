@@ -249,6 +249,78 @@ class TestLLMClientGenerate:
             assert len(call_kwargs["messages"]) == 2
 
     @pytest.mark.asyncio
+    async def test_generate_without_rpm_uses_bare_acompletion(self):
+        """generate calls litellm.acompletion directly when rpm/tpm are unset (regression guard)."""
+        config = LLMConfig(model="openai/gpt-5.2")
+        client = LLMClient(config)
+
+        mock_message = MagicMock()
+        mock_message.content = "Hello, world!"
+        mock_message.thinking = None
+
+        mock_choice = MagicMock()
+        mock_choice.message = mock_message
+
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+
+        with (
+            patch(
+                "autorubric.llm.litellm.acompletion", new_callable=AsyncMock
+            ) as mock_completion,
+            patch("autorubric.llm.RouterPool") as mock_router_pool,
+        ):
+            mock_completion.return_value = mock_response
+
+            result = await client.generate(
+                system_prompt="You are helpful.",
+                user_prompt="Say hello",
+            )
+
+            assert result == "Hello, world!"
+            mock_completion.assert_called_once()
+            mock_router_pool.get_instance.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_generate_with_rpm_routes_through_router(self):
+        """generate routes through a RouterPool-provided Router when rpm is set."""
+        config = LLMConfig(model="openai/gpt-5.2", rpm=50)
+        client = LLMClient(config)
+
+        mock_message = MagicMock()
+        mock_message.content = "Hello, world!"
+        mock_message.thinking = None
+
+        mock_choice = MagicMock()
+        mock_choice.message = mock_message
+
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+
+        mock_router = MagicMock()
+        mock_router.acompletion = AsyncMock(return_value=mock_response)
+
+        with (
+            patch(
+                "autorubric.llm.litellm.acompletion", new_callable=AsyncMock
+            ) as mock_completion,
+            patch("autorubric.llm.RouterPool") as mock_router_pool,
+        ):
+            mock_router_pool.get_instance.return_value.get_router.return_value = mock_router
+
+            result = await client.generate(
+                system_prompt="You are helpful.",
+                user_prompt="Say hello",
+            )
+
+            assert result == "Hello, world!"
+            mock_completion.assert_not_called()
+            mock_router_pool.get_instance.return_value.get_router.assert_called_once_with(
+                "openai/gpt-5.2", 50, None
+            )
+            mock_router.acompletion.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_generate_with_cache_hit(self):
         """generate returns cached response on cache hit."""
         with tempfile.TemporaryDirectory() as temp_dir:

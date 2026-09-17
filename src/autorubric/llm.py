@@ -32,6 +32,7 @@ from tenacity import (
 )
 
 from autorubric.rate_limit import RateLimitPool
+from autorubric.router_pool import RouterPool
 
 if TYPE_CHECKING:
     from autorubric.types import TokenUsage
@@ -399,6 +400,17 @@ class LLMConfig:
         max_parallel_requests: Maximum concurrent requests to this model's provider.
             When set, a global per-provider semaphore limits parallel requests.
             None (default) means unlimited parallel requests.
+        rpm: Requests-per-minute ceiling to enforce for this model, via a
+            litellm.Router with `enforce_model_rate_limits` (a rolling 60s
+            window, not a concurrency count -- unlike max_parallel_requests,
+            which only approximates an RPM ceiling and drifts with latency).
+            When set, calls are routed through litellm.Router instead of a
+            bare litellm.acompletion(); once the ceiling is hit, Router raises
+            litellm.RateLimitError, which the existing retry decorator already
+            catches and backs off on. None (default) disables RPM enforcement.
+            Can be combined with max_parallel_requests and/or tpm.
+        tpm: Tokens-per-minute ceiling to enforce for this model, via the same
+            litellm.Router mechanism as `rpm`. None (default) disables it.
         cache_enabled: Default caching behavior (can be overridden per-request).
         cache_dir: Directory for response cache.
         cache_ttl: Cache time-to-live in seconds (None = no expiration).
@@ -455,6 +467,8 @@ class LLMConfig:
     retry_min_wait: float = 1.0
     retry_max_wait: float = 60.0
     max_parallel_requests: int | None = None
+    rpm: int | None = None
+    tpm: int | None = None
     cache_enabled: bool = False
     cache_dir: str | Path = ".autorubric_cache"
     cache_ttl: int | None = None  # None = no expiration
@@ -795,7 +809,13 @@ class LLMClient:
         @retry_decorator
         async def _call() -> str:
             nonlocal thinking_content, raw_response
-            response = await litellm.acompletion(**params)
+            if self.config.rpm is not None or self.config.tpm is not None:
+                router = RouterPool.get_instance().get_router(
+                    model, self.config.rpm, self.config.tpm
+                )
+                response = await router.acompletion(**params)
+            else:
+                response = await litellm.acompletion(**params)
             raw_response = response
 
             message = response.choices[0].message
