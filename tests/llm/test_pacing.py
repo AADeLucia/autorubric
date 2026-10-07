@@ -189,6 +189,71 @@ class TestBackendHealth:
         assert all(isinstance(r, BackendUnavailableError) for r in results)
 
 
+class TestBreakerInterruptsAGatheredBatch:
+    """The breaker must stop a batch that is already in flight.
+
+    Regression: the gate was originally checked once per request before
+    queueing, so every coroutine in an asyncio.gather passed it before the
+    first failure had been recorded. Against a dead backend the whole batch ran
+    to completion and the breaker never fired -- the exact outcome it exists to
+    prevent. It is now checked after the semaphore and rate limiter, so only
+    the in-flight few are ever past the gate.
+    """
+
+    def setup_method(self):
+        RateLimiterPool.reset_instance()
+        BackendHealthPool.reset_instance()
+
+    def teardown_method(self):
+        RateLimiterPool.reset_instance()
+        BackendHealthPool.reset_instance()
+
+    @pytest.mark.asyncio
+    async def test_dead_backend_aborts_before_issuing_every_request(self, monkeypatch):
+        from unittest.mock import AsyncMock, patch
+
+        from autorubric.llm import LLMClient, LLMConfig
+
+        async def no_sleep(delay):
+            return None
+
+        monkeypatch.setattr("autorubric.pacing.asyncio.sleep", no_sleep)
+
+        config = LLMConfig(
+            model="hosted_vllm/dead",
+            api_base="http://127.0.0.1:9/v1",
+            max_retries=0,
+            max_parallel_requests=4,
+            max_consecutive_infra_failures=5,
+            infra_retry_backoff=(1.0,),
+            infra_retry_max_wait=2.0,
+        )
+        client = LLMClient(config)
+
+        attempts = 0
+
+        async def always_down(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            raise infra_error()
+
+        with patch("autorubric.llm.litellm.acompletion", new=AsyncMock(side_effect=always_down)):
+            results = await asyncio.gather(
+                *(
+                    client.generate(system_prompt="s", user_prompt=f"u{i}")
+                    for i in range(200)
+                ),
+                return_exceptions=True,
+            )
+
+        assert any(isinstance(r, BackendUnavailableError) for r in results), (
+            "a dead backend must surface BackendUnavailableError"
+        )
+        assert attempts < 200, (
+            f"breaker never interrupted the batch: all {attempts} requests were issued"
+        )
+
+
 class TestBackendHealthPool:
     def setup_method(self):
         BackendHealthPool.reset_instance()

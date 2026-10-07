@@ -868,6 +868,17 @@ class LLMClient:
             else 0
         )
 
+        async def _send() -> Any:
+            # The breaker is consulted here, after queueing, rather than once up
+            # front. A batch dispatched by a single asyncio.gather would
+            # otherwise pass the gate in its entirety before the first failure
+            # was recorded, so the breaker could never interrupt the very batch
+            # it exists to stop. Checking after the semaphore and rate limiter
+            # means only the in-flight few are ever past the gate.
+            if health is not None:
+                await health.before_request()
+            return await litellm.acompletion(**params)
+
         async def _attempt() -> str:
             nonlocal thinking_content, raw_response
             # Pacing and the concurrency semaphore are acquired per attempt and
@@ -877,9 +888,9 @@ class LLMClient:
                 await limiter.acquire(estimated_tokens)
             if semaphore is not None:
                 async with semaphore:
-                    response = await litellm.acompletion(**params)
+                    response = await _send()
             else:
-                response = await litellm.acompletion(**params)
+                response = await _send()
             raw_response = response
 
             message = response.choices[0].message
@@ -894,8 +905,6 @@ class LLMClient:
 
         # The breaker counts whole requests, not attempts: a call that exhausts
         # its retries is one infrastructure failure, not max_retries of them.
-        if health is not None:
-            await health.before_request()
         try:
             response_content = await _call()
         except BaseException as exc:

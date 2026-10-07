@@ -109,6 +109,12 @@ class RateLimiterPool:
     account-wide: two models behind the same gateway share one ceiling. When
     the same provider is requested with different limits the *strictest* wins,
     matching `RateLimitPool`'s handling of `max_parallel_requests`.
+
+    The pool is per *process*. Two runs sharing one API key will each pace to
+    `rpm` and collectively exceed it -- observed against the WSE gateway on
+    2026-10-07, where two concurrent processes at rpm=50 drew a server-side
+    `GATEWAY_KEY_RPM_LIMITED` 429. Set `rpm` to the key's share, not the key's
+    whole ceiling, when more than one run is in flight.
     """
 
     _instance: ClassVar[RateLimiterPool | None] = None
