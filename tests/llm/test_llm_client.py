@@ -328,6 +328,48 @@ class TestLLMClientGenerate:
         RateLimiterPool.reset_instance()
 
     @pytest.mark.asyncio
+    async def test_transient_server_errors_are_retried(self):
+        """A 500 must not cost a criterion on the first try.
+
+        litellm reports both an overloaded self-hosted server and a refused
+        connection to a vLLM endpoint as InternalServerError. It was classified
+        as infrastructure everywhere but was absent from the retry set, so a
+        single blip went straight to CANNOT_ASSESS with no retry at all.
+        """
+        import litellm
+
+        RateLimiterPool.reset_instance()
+        config = LLMConfig(model="hosted_vllm/q", max_retries=3, retry_min_wait=0.001,
+                           retry_max_wait=0.002)
+        client = LLMClient(config)
+
+        mock_message = MagicMock()
+        mock_message.content = "recovered"
+        mock_message.thinking = None
+        mock_choice = MagicMock()
+        mock_choice.message = mock_message
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+
+        attempts = 0
+
+        async def flaky(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise litellm.InternalServerError(
+                    message="Cannot connect to host stub:1234", llm_provider="hosted_vllm", model="q"
+                )
+            return mock_response
+
+        with patch("autorubric.llm.litellm.acompletion", new=AsyncMock(side_effect=flaky)):
+            result = await client.generate(system_prompt="s", user_prompt="u")
+
+        assert result == "recovered"
+        assert attempts == 3
+        RateLimiterPool.reset_instance()
+
+    @pytest.mark.asyncio
     async def test_generate_many_isolates_failures(self):
         """One bad request must not cancel its siblings.
 

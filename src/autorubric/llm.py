@@ -683,6 +683,14 @@ class LLMClient:
                     litellm.ServiceUnavailableError,
                     litellm.APIConnectionError,
                     litellm.Timeout,
+                    # A self-hosted server under load returns 500, and litellm
+                    # also wraps connection refusal from a vLLM endpoint as
+                    # InternalServerError ("Cannot connect to host ..."). Both
+                    # are transient-class, and both were previously given zero
+                    # retries despite being classified as infrastructure, so one
+                    # blip silently cost a criterion. A genuinely dead backend
+                    # is handled by the circuit breaker, not by retrying here.
+                    litellm.InternalServerError,
                 )
             ),
             # max_retries counts retries, so the initial attempt is extra.
