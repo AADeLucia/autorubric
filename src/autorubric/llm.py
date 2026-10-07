@@ -761,7 +761,11 @@ class LLMClient:
         # handle caching automatically (OpenAI, Deepseek) or don't support it
         is_anthropic = model.startswith("anthropic/") or model.startswith("claude")
         use_prompt_caching = self.config.prompt_caching and is_anthropic
-        if use_prompt_caching:
+        # An empty system prompt is omitted rather than sent as an empty system
+        # message, which some providers treat differently from having none.
+        if not system_prompt:
+            messages = [{"role": "user", "content": user_prompt}]
+        elif use_prompt_caching:
             # Anthropic requires cache_control on message content
             messages = [
                 {
