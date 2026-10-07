@@ -690,6 +690,7 @@ class CriterionGrader(Grader):
                 # Preserve the extended-thinking deliberation trace. getattr
                 # guards custom binary_response_format models that lack the field.
                 reasoning=getattr(judgment, "reasoning", None),
+                raw_response=result.response_snapshot,
                 weight=criterion.weight,
                 name=criterion.name,
                 options=criterion.options,
@@ -725,6 +726,11 @@ class CriterionGrader(Grader):
                 verdict=verdict,
                 reason=f"Judge call failed ({category}): {str(e)}",
                 error=f"{category}: {str(e)}",
+                # The whole point of the exercise: a failed judge call used to
+                # leave behind nothing but this stringified message. getattr
+                # rather than isinstance so an unrelated exception type still
+                # works -- it simply carries no snapshot.
+                raw_response=getattr(e, "response_snapshot", None),
                 weight=criterion.weight,
                 name=criterion.name,
                 options=criterion.options,
@@ -844,6 +850,7 @@ class CriterionGrader(Grader):
                 reason=reason,
                 # Preserve the extended-thinking deliberation trace.
                 reasoning=getattr(judgment, "reasoning", None),
+                raw_response=result.response_snapshot,
                 weight=criterion.weight,
                 name=criterion.name,
                 options=criterion.options,
@@ -912,6 +919,8 @@ class CriterionGrader(Grader):
                 multi_choice_verdict=multi_choice_verdict,
                 reason=f"Judge call failed ({category}): {str(e)}",
                 error=f"{category}: {str(e)}",
+                # See the binary path.
+                raw_response=getattr(e, "response_snapshot", None),
                 weight=criterion.weight,
                 name=criterion.name,
                 options=criterion.options,
@@ -1032,6 +1041,7 @@ class CriterionGrader(Grader):
                                 shuffle_order=cr.report.shuffle_order,
                                 error=cr.report.error,
                                 reasoning=cr.report.reasoning,
+                                raw_response=cr.report.raw_response,
                             )
                         )
 
@@ -1071,6 +1081,7 @@ class CriterionGrader(Grader):
                             weight=judge_result.weight,
                             error=cr.report.error,
                             reasoning=cr.report.reasoning,
+                            raw_response=cr.report.raw_response,
                         )
                     )
 

@@ -3,7 +3,7 @@
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -621,6 +621,8 @@ class MultiChoiceJudgeVote(BaseModel):
         reasoning: The judge's verbose extended-thinking deliberation trace (populated
             only when thinking is enabled; None otherwise). ``reason`` is the conclusion
             distilled from it. Mirrors ``JudgeVote.reasoning`` for multi-choice criteria.
+        raw_response: What the model returned for this vote. Mirrors
+            ``JudgeVote.raw_response`` for multi-choice criteria; see that field.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -635,6 +637,7 @@ class MultiChoiceJudgeVote(BaseModel):
     shuffle_order: list[int] | None = None
     error: str | None = None
     reasoning: str | None = None
+    raw_response: dict[str, Any] | None = None
 
     @property
     def is_error(self) -> bool:
@@ -670,6 +673,12 @@ class CriterionReport(Criterion):
             chain of thought produced before settling on ``verdict``/``reason`` (the
             provider's ``reasoning_content`` channel). Populated only when thinking is
             enabled; None otherwise. ``reason`` is the conclusion distilled from this.
+        raw_response: A small JSON-safe record of what the model actually returned
+            for this criterion -- ``content``, ``finish_reason``, ``reasoning_content``
+            and ``usage``. Present on both genuine verdicts and error-synthesized ones,
+            and it is the error case it exists for: when ``error`` is set this is the
+            only evidence of *why* the call failed. None only when the call never
+            reached the model at all (e.g. a connection error).
     """
 
     verdict: CriterionVerdict | None = None
@@ -678,6 +687,7 @@ class CriterionReport(Criterion):
     shuffle_order: list[int] | None = None
     error: str | None = None
     reasoning: str | None = None
+    raw_response: dict[str, Any] | None = None
 
     @property
     def score_value(self) -> float:
@@ -870,6 +880,8 @@ class JudgeVote(BaseModel):
         reasoning: The judge's verbose extended-thinking deliberation trace (populated
             only when thinking is enabled; None otherwise). ``reason`` is the conclusion
             distilled from it. Carried from this judge's ``CriterionReport.reasoning``.
+        raw_response: What the model returned for this vote. Carried from this judge's
+            ``CriterionReport.raw_response``; see that field.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -880,6 +892,7 @@ class JudgeVote(BaseModel):
     weight: float = 1.0
     error: str | None = None
     reasoning: str | None = None
+    raw_response: dict[str, Any] | None = None
 
     @property
     def is_error(self) -> bool:

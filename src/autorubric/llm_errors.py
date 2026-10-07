@@ -28,6 +28,28 @@ failure as ``unknown`` therefore corrupts scores rather than merely mislabelling
 """
 
 
+class ResponseParseError(ValueError):
+    """The judge responded, but its output could not be parsed into the schema.
+
+    Carries ``response_snapshot``: a JSON-safe record of what the model actually
+    returned (content, ``finish_reason``, reasoning trace, usage). Without it a
+    parse failure leaves behind only a stringified exception, which is how the
+    2026-10-07 contentless-response incident stayed undiagnosed -- the response
+    object was alive in a local variable at the moment of failure and was simply
+    discarded as the exception unwound.
+
+    Subclassing ``ValueError`` is deliberate and load-bearing: it makes
+    `classify_grading_error` route this to ``"parse"`` (and so to CANNOT_ASSESS,
+    excluded from scoring) via the branch that already exists, with no change to
+    the classifier. Do not reparent this to a bare ``Exception`` -- that would
+    silently demote every parse failure to ``"unknown"``, which is *scored*.
+    """
+
+    def __init__(self, message: str, *, response_snapshot: dict | None = None) -> None:
+        super().__init__(message)
+        self.response_snapshot = response_snapshot
+
+
 class BackendUnavailableError(Exception):
     """Raised when a backend has failed persistently enough to abandon the run.
 

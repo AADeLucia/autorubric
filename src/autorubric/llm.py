@@ -35,6 +35,7 @@ from tenacity import (
 from autorubric.llm_errors import (
     BackendUnavailableError,
     ErrorCategory,
+    ResponseParseError,
     classify_grading_error,
 )
 from autorubric.pacing import BackendHealthPool, RateLimiterPool, normalize_to_provider
@@ -183,6 +184,12 @@ class GenerateResult:
             LiteLLM's completion_cost() function. None if cost calculation fails.
         parsed: The parsed Pydantic model instance when response_format was provided.
             None if no response_format was used or parsing failed.
+        response_snapshot: A small, JSON-safe record of what the model returned
+            (content, finish_reason, reasoning trace, usage) -- see
+            `_response_snapshot`. Distinct from `raw_response`: that is the live
+            provider object for in-process use, this is what survives being
+            written to disk. The matching failure-path snapshot rides on
+            `ResponseParseError.response_snapshot`.
     """
 
     content: str
@@ -191,6 +198,7 @@ class GenerateResult:
     usage: TokenUsage | None = None
     cost: float | None = None
     parsed: Any = None
+    response_snapshot: dict[str, Any] | None = None
 
 
 @dataclass
@@ -254,6 +262,59 @@ def _extract_thinking_content(message: Any) -> str | None:
         return message.thinking
 
     return None
+
+
+def _response_snapshot(
+    response: Any,
+    content: str | None,
+    thinking: str | None,
+) -> dict[str, Any]:
+    """Build a JSON-safe, diagnosable record of one model response.
+
+    Kept deliberately small and flat: this is written to every criterion of every
+    checkpoint record, and is meant to be greppable and `jq`-able after the fact.
+
+    ``finish_reason`` is the field that earns this function's existence. Nothing
+    else in autorubric reads it, yet it is what distinguishes a judge that ran out
+    of budget mid-generation (``"length"``) from one that stopped cleanly without
+    emitting content (``"stop"``) -- the exact question left open by the
+    2026-10-07 contentless-response incident.
+
+    Every access is guarded. This runs on the error path, where the response may
+    itself be malformed, and an exception raised here would mask the original
+    failure it is supposed to explain.
+    """
+    snapshot: dict[str, Any] = {
+        "content": content,
+        # Explicit, because `None` (no content at all) and `""` (empty string)
+        # have very different causes and are indistinguishable once serialized.
+        "content_is_none": content is None,
+        "reasoning_content": thinking,
+        "finish_reason": None,
+        "model": None,
+        "response_id": None,
+        "usage": None,
+    }
+    if response is None:
+        return snapshot
+
+    try:
+        choices = getattr(response, "choices", None) or []
+        if choices:
+            snapshot["finish_reason"] = getattr(choices[0], "finish_reason", None)
+        snapshot["model"] = getattr(response, "model", None)
+        snapshot["response_id"] = getattr(response, "id", None)
+
+        usage = _extract_usage_from_response(response)
+        snapshot["usage"] = {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+        }
+    except Exception:  # pragma: no cover - defensive, see docstring
+        logger.debug("Could not fully snapshot response", exc_info=True)
+
+    return snapshot
 
 
 def _extract_usage_from_response(response: Any) -> TokenUsage:
@@ -926,18 +987,31 @@ class LLMClient:
         usage = _extract_usage_from_response(raw_response)
         cost = _calculate_completion_cost(raw_response)
 
+        snapshot = _response_snapshot(raw_response, response_content, thinking_content)
+
         # Parse structured output if requested
         parsed_response: T | None = None
         if response_format is not None:
-            # LiteLLM returns JSON string when response_format is set
-            # Parse it into the Pydantic model
-            data = json.loads(response_content)
+            # Parsing deliberately sits outside the retried `_attempt` above --
+            # a malformed body is not a transport failure and retrying it would
+            # just re-pay for the same bad response. But that also means the
+            # exception is all that escapes, and on the way out it would take the
+            # response with it. Re-raise carrying the snapshot so the caller can
+            # record what the model actually said; `from exc` preserves the
+            # original message verbatim, so error strings stay comparable with
+            # those already written to existing checkpoints.
+            try:
+                # LiteLLM returns JSON string when response_format is set
+                # Parse it into the Pydantic model
+                data = json.loads(response_content)
 
-            # Inject thinking content into the reasoning field if available
-            if thinking_content and "reasoning" in response_format.model_fields:
-                data["reasoning"] = thinking_content
+                # Inject thinking content into the reasoning field if available
+                if thinking_content and "reasoning" in response_format.model_fields:
+                    data["reasoning"] = thinking_content
 
-            parsed_response = response_format.model_validate(data)
+                parsed_response = response_format.model_validate(data)
+            except Exception as exc:
+                raise ResponseParseError(str(exc), response_snapshot=snapshot) from exc
 
         # Determine what to return
         result: str | T | GenerateResult
@@ -950,6 +1024,7 @@ class LLMClient:
                 usage=usage,
                 cost=cost,
                 parsed=parsed_response,
+                response_snapshot=snapshot,
             )
         elif response_format is not None:
             # Return just the parsed Pydantic model

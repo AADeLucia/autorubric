@@ -25,6 +25,7 @@ from autorubric import (
     CriterionOption,
     CriterionVerdict,
     ErrorCategory,
+    ResponseParseError,
     Rubric,
     TokenUsage,
     classify_grading_error,
@@ -931,3 +932,140 @@ class TestBackendUnavailableAborts:
         assert report.error is None, "no run-level signal -- fail_fast would never fire"
         assert report.report[0].final_verdict == CriterionVerdict.CANNOT_ASSESS
         assert report.report[0].is_error
+
+
+# =============================================================================
+# Raw-response capture
+# =============================================================================
+
+
+_SNAPSHOT = {
+    "content": None,
+    "content_is_none": True,
+    "reasoning_content": "deliberating at length...",
+    "finish_reason": "length",
+    "model": "hosted_vllm/Qwen3.5-27B",
+    "response_id": "chatcmpl-abc123",
+    "usage": {"prompt_tokens": 1200, "completion_tokens": 36000, "total_tokens": 37200},
+}
+
+
+class TestRawResponseCapture:
+    """A failed judge call must leave behind what the model actually returned.
+
+    Before this, a failure left only a stringified exception, so the 2026-10-07
+    contentless-response incident could not be diagnosed from checkpoints at all --
+    there was no way to tell a budget-exhausted judge (``finish_reason="length"``)
+    from one that stopped cleanly without emitting content.
+    """
+
+    @pytest.mark.asyncio
+    async def test_failed_call_records_the_response(self, mock_llm_config):
+        rubric = Rubric([Criterion(weight=1.0, requirement="Criterion A")])
+        exc = ResponseParseError(
+            "the JSON object must be str, bytes or bytearray, not NoneType",
+            response_snapshot=_SNAPSHOT,
+        )
+
+        with patch(
+            "autorubric.graders.criterion_grader.LLMClient",
+            return_value=_client_raising(exc),
+        ):
+            grader = CriterionGrader(llm_config=mock_llm_config)
+            report = await rubric.grade("submission", grader=grader)
+
+        cr = report.report[0]
+        assert cr.error is not None and cr.error.startswith("parse:")
+
+        # The snapshot must reach the vote, which is what the pipeline reads.
+        vote = cr.votes[0]
+        assert vote.raw_response is not None
+        assert vote.raw_response["finish_reason"] == "length"
+        assert vote.raw_response["content_is_none"] is True
+        assert vote.raw_response["usage"]["completion_tokens"] == 36000
+
+    @pytest.mark.asyncio
+    async def test_successful_call_records_the_response(self, mock_llm_config):
+        """A clean baseline, so a failure has something to be compared against."""
+        rubric = Rubric([Criterion(weight=1.0, requirement="Criterion A")])
+        ok = _ok_binary_result(CriterionVerdict.MET)
+        ok.response_snapshot = {"finish_reason": "stop", "content_is_none": False}
+
+        client = MagicMock()
+        client.generate = AsyncMock(return_value=ok)
+        with patch("autorubric.graders.criterion_grader.LLMClient", return_value=client):
+            grader = CriterionGrader(llm_config=mock_llm_config)
+            report = await rubric.grade("submission", grader=grader)
+
+        cr = report.report[0]
+        assert cr.error is None
+        assert cr.votes[0].raw_response == {"finish_reason": "stop", "content_is_none": False}
+
+    @pytest.mark.asyncio
+    async def test_exception_without_a_snapshot_is_tolerated(self, mock_llm_config):
+        """An unrelated exception carries no snapshot; grading must still work."""
+        rubric = Rubric([Criterion(weight=1.0, requirement="Criterion A")])
+
+        with patch(
+            "autorubric.graders.criterion_grader.LLMClient",
+            return_value=_client_raising(RuntimeError("something else entirely")),
+        ):
+            grader = CriterionGrader(llm_config=mock_llm_config)
+            report = await rubric.grade("submission", grader=grader)
+
+        assert report.report[0].votes[0].raw_response is None
+
+    @pytest.mark.asyncio
+    async def test_multi_choice_path_records_the_response(self, mock_llm_config):
+        """Parity with the binary path -- asymmetry here would be a future trap."""
+        rubric = Rubric(
+            [
+                Criterion(
+                    weight=1.0,
+                    requirement="Criterion A",
+                    options=[
+                        CriterionOption(label="Good", value=1.0),
+                        CriterionOption(label="Bad", value=0.0),
+                    ],
+                )
+            ]
+        )
+        exc = ResponseParseError("no content", response_snapshot=_SNAPSHOT)
+
+        with patch(
+            "autorubric.graders.criterion_grader.LLMClient",
+            return_value=_client_raising(exc),
+        ):
+            grader = CriterionGrader(llm_config=mock_llm_config)
+            report = await rubric.grade("submission", grader=grader)
+
+        vote = report.report[0].multi_choice_votes[0]
+        assert vote.raw_response is not None
+        assert vote.raw_response["finish_reason"] == "length"
+
+    @pytest.mark.asyncio
+    async def test_survives_serialization_round_trip(self, mock_llm_config):
+        """It is only useful if it reaches disk and comes back."""
+        rubric = Rubric([Criterion(weight=1.0, requirement="Criterion A")])
+        exc = ResponseParseError("no content", response_snapshot=_SNAPSHOT)
+
+        with patch(
+            "autorubric.graders.criterion_grader.LLMClient",
+            return_value=_client_raising(exc),
+        ):
+            grader = CriterionGrader(llm_config=mock_llm_config)
+            report = await rubric.grade("submission", grader=grader)
+
+        item = DataItem(submission="submission", description="test item")
+        item_result = ItemResult(item_idx=0, item=item, report=report, duration_seconds=0.1)
+        payload = json.loads(json.dumps(item_result.to_dict()))
+        restored = ItemResult.from_dict(payload, item)
+
+        assert restored.report.report[0].votes[0].raw_response["finish_reason"] == "length"
+
+    def test_records_predating_this_field_still_load(self):
+        """Old checkpoints have no such key; they must deserialize unchanged."""
+        vote = JudgeVote.model_validate(
+            {"judge_id": "default", "verdict": "MET", "reason": "ok"}
+        )
+        assert vote.raw_response is None
