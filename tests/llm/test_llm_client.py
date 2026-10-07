@@ -1,12 +1,20 @@
 """Tests for LLMClient class."""
 
+import asyncio
 import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import BaseModel
 
-from autorubric.llm import LLMClient, LLMConfig, _provider_response_format
+from autorubric.llm import (
+    BackendUnavailableError,
+    GenerateRequest,
+    LLMClient,
+    LLMConfig,
+    _provider_response_format,
+)
+from autorubric.pacing import RateLimiterPool
 
 
 class MockResponse(BaseModel):
@@ -249,11 +257,14 @@ class TestLLMClientGenerate:
             assert len(call_kwargs["messages"]) == 2
 
     @pytest.mark.asyncio
-    async def test_generate_without_rpm_uses_bare_acompletion(self):
-        """generate calls litellm.acompletion directly when rpm/tpm are unset (regression guard)."""
-        config = LLMConfig(model="openai/gpt-5.2")
-        client = LLMClient(config)
+    async def test_generate_always_uses_bare_acompletion(self):
+        """There is one call path regardless of rpm.
 
+        rpm used to switch generate onto a litellm.Router whose rate-limit
+        pre-call check raised instead of waiting. Pacing is now applied before
+        the call, so litellm.acompletion is the only path.
+        """
+        RateLimiterPool.reset_instance()
         mock_message = MagicMock()
         mock_message.content = "Hello, world!"
         mock_message.thinking = None
@@ -264,61 +275,115 @@ class TestLLMClientGenerate:
         mock_response = MagicMock()
         mock_response.choices = [mock_choice]
 
-        with (
-            patch(
-                "autorubric.llm.litellm.acompletion", new_callable=AsyncMock
-            ) as mock_completion,
-            patch("autorubric.llm.RouterPool") as mock_router_pool,
+        for config in (
+            LLMConfig(model="openai/gpt-5.2"),
+            LLMConfig(model="openai/gpt-5.2", rpm=6000),
         ):
-            mock_completion.return_value = mock_response
+            client = LLMClient(config)
+            with patch(
+                "autorubric.llm.litellm.acompletion", new_callable=AsyncMock
+            ) as mock_completion:
+                mock_completion.return_value = mock_response
 
-            result = await client.generate(
-                system_prompt="You are helpful.",
-                user_prompt="Say hello",
-            )
+                result = await client.generate(
+                    system_prompt="You are helpful.",
+                    user_prompt="Say hello",
+                )
 
-            assert result == "Hello, world!"
-            mock_completion.assert_called_once()
-            mock_router_pool.get_instance.assert_not_called()
+                assert result == "Hello, world!"
+                mock_completion.assert_called_once()
+        RateLimiterPool.reset_instance()
 
     @pytest.mark.asyncio
-    async def test_generate_with_rpm_routes_through_router(self):
-        """generate routes through a RouterPool-provided Router when rpm is set."""
-        config = LLMConfig(model="openai/gpt-5.2", rpm=50)
+    async def test_rpm_burst_does_not_raise(self):
+        """A burst far wider than rpm completes without a rate-limit error.
+
+        This is the regression that killed two production runs: 64 requests
+        dispatched at once against rpm=50 previously tripped the Router's
+        admission gate, and its retries pushed the counter further past the
+        limit until the calls failed outright.
+        """
+        RateLimiterPool.reset_instance()
+        config = LLMConfig(model="openai/gpt-5.2", rpm=6000)
         client = LLMClient(config)
 
         mock_message = MagicMock()
-        mock_message.content = "Hello, world!"
+        mock_message.content = "ok"
         mock_message.thinking = None
-
         mock_choice = MagicMock()
         mock_choice.message = mock_message
-
         mock_response = MagicMock()
         mock_response.choices = [mock_choice]
 
-        mock_router = MagicMock()
-        mock_router.acompletion = AsyncMock(return_value=mock_response)
+        with patch(
+            "autorubric.llm.litellm.acompletion", new_callable=AsyncMock
+        ) as mock_completion:
+            mock_completion.return_value = mock_response
+            results = await asyncio.gather(
+                *(client.generate(system_prompt="s", user_prompt=f"u{i}") for i in range(64))
+            )
 
-        with (
-            patch(
-                "autorubric.llm.litellm.acompletion", new_callable=AsyncMock
-            ) as mock_completion,
-            patch("autorubric.llm.RouterPool") as mock_router_pool,
+        assert results == ["ok"] * 64
+        assert mock_completion.await_count == 64
+        RateLimiterPool.reset_instance()
+
+    @pytest.mark.asyncio
+    async def test_generate_many_isolates_failures(self):
+        """One bad request must not cancel its siblings.
+
+        The pipeline previously gathered a whole batch without
+        return_exceptions, so a single rate-limit error killed the process and
+        discarded every in-flight sibling.
+        """
+        client = LLMClient(LLMConfig(model="openai/gpt-5.2"))
+        requests = [GenerateRequest(user_prompt=f"u{i}") for i in range(5)]
+
+        async def flaky(system_prompt, user_prompt, **kwargs):
+            if user_prompt == "u2":
+                raise ValueError("bad request")
+            return f"ok:{user_prompt}"
+
+        with patch.object(client, "generate", side_effect=flaky):
+            outcomes = await client.generate_many(requests)
+
+        assert [o.index for o in outcomes] == [0, 1, 2, 3, 4]
+        assert [o.ok for o in outcomes] == [True, True, False, True, True]
+        assert outcomes[2].error == "bad request"
+        assert outcomes[2].content is None
+        assert outcomes[3].content == "ok:u3"
+
+    @pytest.mark.asyncio
+    async def test_generate_many_propagates_backend_unavailable(self):
+        """A dead backend is a run-level condition, not a per-item one."""
+        client = LLMClient(LLMConfig(model="openai/gpt-5.2"))
+        requests = [GenerateRequest(user_prompt=f"u{i}") for i in range(3)]
+
+        with patch.object(
+            client, "generate", side_effect=BackendUnavailableError("server gone")
         ):
-            mock_router_pool.get_instance.return_value.get_router.return_value = mock_router
+            with pytest.raises(BackendUnavailableError):
+                await client.generate_many(requests)
 
-            result = await client.generate(
-                system_prompt="You are helpful.",
-                user_prompt="Say hello",
-            )
+    @pytest.mark.asyncio
+    async def test_generate_many_respects_max_concurrent(self):
+        client = LLMClient(LLMConfig(model="openai/gpt-5.2"))
+        requests = [GenerateRequest(user_prompt=f"u{i}") for i in range(20)]
+        in_flight = 0
+        peak = 0
 
-            assert result == "Hello, world!"
-            mock_completion.assert_not_called()
-            mock_router_pool.get_instance.return_value.get_router.assert_called_once_with(
-                "openai/gpt-5.2", 50, None
-            )
-            mock_router.acompletion.assert_called_once()
+        async def tracked(system_prompt, user_prompt, **kwargs):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0)
+            in_flight -= 1
+            return "ok"
+
+        with patch.object(client, "generate", side_effect=tracked):
+            outcomes = await client.generate_many(requests, max_concurrent=4)
+
+        assert all(o.ok for o in outcomes)
+        assert peak <= 4
 
     @pytest.mark.asyncio
     async def test_generate_with_cache_hit(self):

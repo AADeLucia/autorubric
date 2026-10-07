@@ -11,7 +11,10 @@ from autorubric.eval import (
     evaluate,
 )
 from autorubric.llm import (
+    BackendUnavailableError,
     ErrorCategory,
+    GenerateOutcome,
+    GenerateRequest,
     GenerateResult,
     LLMClient,
     LLMConfig,
@@ -117,7 +120,10 @@ __all__ = [
     "DataItem",
     "RubricDataset",
     # LLM Infrastructure
+    "BackendUnavailableError",
     "ErrorCategory",
+    "GenerateOutcome",
+    "GenerateRequest",
     "GenerateResult",
     "LLMClient",
     "LLMConfig",

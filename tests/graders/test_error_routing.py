@@ -20,6 +20,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from autorubric import (
+    BackendUnavailableError,
     Criterion,
     CriterionOption,
     CriterionVerdict,
@@ -781,3 +782,86 @@ class TestVoteIsErrorProperty:
     )
     def test_is_error(self, vote_factory, error: str | None, expected: bool):
         assert vote_factory(error).is_error is expected
+
+
+class TestBackendUnavailableAborts:
+    """A dead backend must stop the run instead of manufacturing unusable rows.
+
+    On 2026-08-14 and again on 2026-10-07, a vLLM server died mid-run and grading
+    carried on for thousands more items, writing a well-formed CANNOT_ASSESS row
+    for every one. EvalConfig.fail_fast cannot catch that: it keys off
+    ItemResult.error, which is only set when rubric.grade() itself raises, and the
+    grader catches every per-criterion exception so it never does.
+    BackendUnavailableError is the single exception deliberately let through.
+    """
+
+    @pytest.mark.asyncio
+    async def test_binary_path_propagates(self, mock_llm_config):
+        rubric = Rubric(
+            [
+                Criterion(weight=1.0, requirement="Criterion A"),
+                Criterion(weight=1.0, requirement="Criterion B"),
+            ]
+        )
+        client = MagicMock()
+        client.generate = AsyncMock(side_effect=BackendUnavailableError("server gone"))
+
+        with patch(
+            "autorubric.graders.criterion_grader.LLMClient",
+            return_value=client,
+        ):
+            grader = CriterionGrader(llm_config=mock_llm_config)
+            with pytest.raises(BackendUnavailableError, match="server gone"):
+                await rubric.grade("submission", grader=grader)
+
+    @pytest.mark.asyncio
+    async def test_multi_choice_path_propagates(self, mock_llm_config):
+        rubric = Rubric(
+            [
+                Criterion(
+                    weight=1.0,
+                    requirement="Pick one",
+                    options=[
+                        CriterionOption(label="good", value=1.0),
+                        CriterionOption(label="bad", value=0.0),
+                    ],
+                )
+            ]
+        )
+        client = MagicMock()
+        client.generate = AsyncMock(side_effect=BackendUnavailableError("server gone"))
+
+        with patch(
+            "autorubric.graders.criterion_grader.LLMClient",
+            return_value=client,
+        ):
+            grader = CriterionGrader(llm_config=mock_llm_config)
+            with pytest.raises(BackendUnavailableError, match="server gone"):
+                await rubric.grade("submission", grader=grader)
+
+    @pytest.mark.asyncio
+    async def test_ordinary_infra_error_is_still_recorded_not_raised(self, mock_llm_config):
+        """The contrast that makes the breaker necessary.
+
+        An ordinary connection error produces a clean report and no exception --
+        indistinguishable from a real run at the item level, which is exactly why
+        a 400-item outage could report success.
+        """
+        rubric = Rubric([Criterion(weight=1.0, requirement="Criterion A")])
+        client = MagicMock()
+        client.generate = AsyncMock(
+            side_effect=litellm.APIConnectionError(
+                message="cannot connect", llm_provider="p", model="m"
+            )
+        )
+
+        with patch(
+            "autorubric.graders.criterion_grader.LLMClient",
+            return_value=client,
+        ):
+            grader = CriterionGrader(llm_config=mock_llm_config)
+            report = await rubric.grade("submission", grader=grader)
+
+        assert report.error is None, "no run-level signal -- fail_fast would never fire"
+        assert report.report[0].final_verdict == CriterionVerdict.CANNOT_ASSESS
+        assert report.report[0].is_error

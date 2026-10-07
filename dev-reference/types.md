@@ -38,7 +38,8 @@ Note: `FewShotConfig` is listed in the Core Types table above (defined in `src/a
 
 | Type | Purpose |
 | --- | --- |
-| `LLMConfig` | model, temperature, max_tokens, thinking, prompt_caching, max_parallel_requests, rpm, tpm |
+| `LLMConfig` | model, temperature, max_tokens, thinking, prompt_caching, max_parallel_requests, rpm, tpm, max_consecutive_infra_failures, infra_retry_backoff, infra_retry_max_wait |
+| `GenerateRequest` / `GenerateOutcome` | prompt pair and per-item result for `LLMClient.generate_many`; `GenerateOutcome.error` carries a failure instead of raising, so one bad request cannot cancel its batch |
 | `LLMClient` | Async client with generate(), caching, rate limiting |
 | `ThinkingConfig` | level (LOW/MEDIUM/HIGH) or budget_tokens |
 | `ErrorCategory` | `Literal["infrastructure", "parse", "unknown"]` — classification of a grading exception |

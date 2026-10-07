@@ -15,7 +15,13 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel
 
 from autorubric.graders.base import Grader
-from autorubric.llm import GenerateResult, LLMClient, LLMConfig, classify_grading_error
+from autorubric.llm import (
+    BackendUnavailableError,
+    GenerateResult,
+    LLMClient,
+    LLMConfig,
+    classify_grading_error,
+)
 from autorubric.prompts import (
     FEW_SHOT_SYSTEM_PROMPT_ADDITION,
     GRADER_SYSTEM_PROMPT_DEFAULT,
@@ -692,6 +698,12 @@ class CriterionGrader(Grader):
             )
             return CriterionResult(report=report, usage=result.usage, cost=result.cost)
 
+        except BackendUnavailableError:
+            # The backend itself is gone, so recording CANNOT_ASSESS here would just
+            # manufacture a plausible-looking row and let the run continue producing
+            # thousands more. Let it propagate and stop the run.
+            raise
+
         except Exception as e:
             # Classify the failure. Infrastructure (API/network) and parse/validation
             # failures are not the submission's fault, so route them to CANNOT_ASSESS
@@ -840,6 +852,11 @@ class CriterionGrader(Grader):
                 shuffle_order=shuffled_indices if self._shuffle_options else None,
             )
             return CriterionResult(report=report, usage=result.usage, cost=result.cost)
+
+        except BackendUnavailableError:
+            # See the binary path: a dead backend stops the run rather than
+            # filling results with unassessable rows.
+            raise
 
         except Exception as e:
             category = classify_grading_error(e)

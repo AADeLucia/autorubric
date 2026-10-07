@@ -7,9 +7,11 @@ and provider-specific features like extended thinking and prompt caching.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -17,10 +19,9 @@ from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 import diskcache
 import litellm
-import openai
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
@@ -28,11 +29,16 @@ from tenacity import (
     retry,
     retry_if_exception_type,
     stop_after_attempt,
-    wait_exponential,
+    wait_random_exponential,
 )
 
+from autorubric.llm_errors import (
+    BackendUnavailableError,
+    ErrorCategory,
+    classify_grading_error,
+)
+from autorubric.pacing import BackendHealthPool, RateLimiterPool, normalize_to_provider
 from autorubric.rate_limit import RateLimitPool
-from autorubric.router_pool import RouterPool
 
 if TYPE_CHECKING:
     from autorubric.types import TokenUsage
@@ -46,43 +52,9 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 
-# ============================================================================
-# Grading error classification
-# ============================================================================
-
-ErrorCategory = Literal["infrastructure", "parse", "unknown"]
-"""Category of a failure encountered while grading a single criterion.
-
-- infrastructure: API/network failure (timeout, connection, rate limit, server error).
-  Not the submission's fault; the judge never produced a usable response.
-- parse: the judge responded but its output could not be parsed/validated into the
-  expected schema. Also not the submission's fault.
-- unknown: an unexpected error that does not fit the above categories.
-"""
-
-
-def classify_grading_error(exc: BaseException) -> ErrorCategory:
-    """Classify an exception raised while grading a criterion.
-
-    Reuses the underlying OpenAI exception taxonomy that LiteLLM builds on: every
-    transient API failure (``Timeout``, ``APIConnectionError``, ``RateLimitError``,
-    ``ServiceUnavailableError``, ``InternalServerError``, status errors, etc.) subclasses
-    ``openai.APIError`` (including ``litellm.APIError`` itself), while parse/validation
-    failures (``json.JSONDecodeError`` -> ``ValueError``, ``pydantic.ValidationError``)
-    do not.
-
-    Args:
-        exc: The exception raised during a judge call.
-
-    Returns:
-        ``"infrastructure"`` for API/network errors, ``"parse"`` for JSON/validation
-        errors, and ``"unknown"`` for anything else.
-    """
-    if isinstance(exc, openai.APIError):
-        return "infrastructure"
-    if isinstance(exc, (ValidationError, ValueError)):
-        return "parse"
-    return "unknown"
+# Grading error classification lives in llm_errors so the pacing layer can use it
+# without a circular import. Re-exported here for backward compatibility.
+__all_errors__ = ("ErrorCategory", "classify_grading_error", "BackendUnavailableError")
 
 
 # ============================================================================
@@ -221,6 +193,31 @@ class GenerateResult:
     parsed: Any = None
 
 
+@dataclass
+class GenerateRequest:
+    """One prompt pair for `LLMClient.generate_many`."""
+
+    user_prompt: str
+    system_prompt: str = ""
+
+
+@dataclass
+class GenerateOutcome:
+    """Result of one request in a batch, successful or not.
+
+    `error` is set instead of raising so that one failed request cannot cancel
+    the rest of the batch. Exactly one of `content`/`error` is populated.
+    """
+
+    index: int
+    content: str | None
+    error: str | None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
 def _extract_thinking_content(message: Any) -> str | None:
     """Extract thinking/reasoning content from LLM response message.
 
@@ -327,6 +324,17 @@ def _calculate_completion_cost(response: Any) -> float | None:
 _debug_console = Console()
 
 
+def _estimate_request_tokens(system_prompt: str, user_prompt: str, max_tokens: int | None) -> int:
+    """Rough token cost of a request, for tpm pacing only.
+
+    Real usage is only known after the response, so a tpm ceiling has to be
+    paced on an estimate: ~4 characters per token for the prompt, plus the
+    full output allowance as a worst case.
+    """
+    prompt_tokens = (len(system_prompt) + len(user_prompt)) // 4
+    return prompt_tokens + (max_tokens or 0)
+
+
 def _print_debug_prompt(system_prompt: str, user_prompt: str, model: str) -> None:
     """Print the fully constructed LLM prompt using Rich formatting."""
     _debug_console.print()
@@ -400,17 +408,23 @@ class LLMConfig:
         max_parallel_requests: Maximum concurrent requests to this model's provider.
             When set, a global per-provider semaphore limits parallel requests.
             None (default) means unlimited parallel requests.
-        rpm: Requests-per-minute ceiling to enforce for this model, via a
-            litellm.Router with `enforce_model_rate_limits` (a rolling 60s
-            window, not a concurrency count -- unlike max_parallel_requests,
-            which only approximates an RPM ceiling and drifts with latency).
-            When set, calls are routed through litellm.Router instead of a
-            bare litellm.acompletion(); once the ceiling is hit, Router raises
-            litellm.RateLimitError, which the existing retry decorator already
-            catches and backs off on. None (default) disables RPM enforcement.
-            Can be combined with max_parallel_requests and/or tpm.
-        tpm: Tokens-per-minute ceiling to enforce for this model, via the same
-            litellm.Router mechanism as `rpm`. None (default) disables it.
+        rpm: Requests-per-minute ceiling for this model's provider, enforced by
+            a token bucket that *waits* for a free slot (see pacing.py). Unlike
+            max_parallel_requests, which only approximates a rate and drifts
+            with latency, this paces the request stream directly: a burst of
+            any size drains at `rpm` without ever raising. None (default)
+            disables pacing. Can be combined with max_parallel_requests/tpm.
+        tpm: Tokens-per-minute ceiling, paced by the same mechanism on an
+            estimated per-request cost. None (default) disables it.
+        max_consecutive_infra_failures: Trip the backend circuit breaker after
+            this many consecutive infrastructure failures, so a backend that
+            has gone away stops the run instead of failing every remaining
+            item individually. 0 (default) disables the breaker; ~10 is
+            reasonable in practice. Any success resets the counter.
+        infra_retry_backoff: Delays between probe attempts while the breaker is
+            tripped. The last value repeats if more probes are needed.
+        infra_retry_max_wait: Total time to keep probing a tripped backend
+            before raising BackendUnavailableError.
         cache_enabled: Default caching behavior (can be overridden per-request).
         cache_dir: Directory for response cache.
         cache_ttl: Cache time-to-live in seconds (None = no expiration).
@@ -469,6 +483,9 @@ class LLMConfig:
     max_parallel_requests: int | None = None
     rpm: int | None = None
     tpm: int | None = None
+    max_consecutive_infra_failures: int = 0
+    infra_retry_backoff: tuple[float, ...] = (30.0, 60.0, 120.0, 300.0)
+    infra_retry_max_wait: float = 900.0
     cache_enabled: bool = False
     cache_dir: str | Path = ".autorubric_cache"
     cache_ttl: int | None = None  # None = no expiration
@@ -532,6 +549,15 @@ class LLMConfig:
             "max_retries",
             "retry_min_wait",
             "retry_max_wait",
+            # Concurrency, pacing, and backend health. Omitting these silently
+            # routed them into extra_params and shipped them to litellm as junk
+            # kwargs, leaving rate limiting off for every YAML-loaded config.
+            "max_parallel_requests",
+            "rpm",
+            "tpm",
+            "max_consecutive_infra_failures",
+            "infra_retry_backoff",
+            "infra_retry_max_wait",
             "cache_enabled",
             "cache_dir",
             "cache_ttl",
@@ -634,8 +660,22 @@ class LLMClient:
         )
         return hashlib.sha256(content.encode()).hexdigest()
 
+    def _backend_key(self, model: str) -> str:
+        """Identify the endpoint for health tracking.
+
+        Keyed on api_base when present so two vLLM servers are tracked
+        separately; otherwise the provider, which is the unit a hosted API
+        fails at.
+        """
+        return self.config.api_base or normalize_to_provider(model)
+
     def _get_retry_decorator(self) -> Any:
-        """Build tenacity retry decorator from config."""
+        """Build tenacity retry decorator from config.
+
+        Waits are randomized. Without jitter, sibling requests rejected at the
+        same instant back off by the same amount and collide again on every
+        attempt, which is how a single burst used to exhaust all its retries.
+        """
         return retry(
             retry=retry_if_exception_type(
                 (
@@ -645,9 +685,10 @@ class LLMClient:
                     litellm.Timeout,
                 )
             ),
-            stop=stop_after_attempt(self.config.max_retries),
-            wait=wait_exponential(
-                min=self.config.retry_min_wait,
+            # max_retries counts retries, so the initial attempt is extra.
+            stop=stop_after_attempt(self.config.max_retries + 1),
+            wait=wait_random_exponential(
+                multiplier=self.config.retry_min_wait,
                 max=self.config.retry_max_wait,
             ),
             reraise=True,
@@ -802,18 +843,37 @@ class LLMClient:
             _print_debug_prompt(system_prompt, user_prompt, model)
 
         # Make request with retries
-        retry_decorator = self._get_retry_decorator()
         thinking_content: str | None = None
         raw_response: Any = None
 
-        @retry_decorator
-        async def _call() -> str:
+        semaphore = await RateLimitPool.get_instance().get_semaphore(
+            model, self.config.max_parallel_requests
+        )
+        limiter = await RateLimiterPool.get_instance().get_limiter(
+            model, self.config.rpm, self.config.tpm
+        )
+        health = await BackendHealthPool.get_instance().get_health(
+            self._backend_key(model),
+            self.config.max_consecutive_infra_failures,
+            self.config.infra_retry_backoff,
+            self.config.infra_retry_max_wait,
+        )
+        estimated_tokens = (
+            _estimate_request_tokens(system_prompt, user_prompt, self.config.max_tokens)
+            if self.config.tpm is not None
+            else 0
+        )
+
+        async def _attempt() -> str:
             nonlocal thinking_content, raw_response
-            if self.config.rpm is not None or self.config.tpm is not None:
-                router = RouterPool.get_instance().get_router(
-                    model, self.config.rpm, self.config.tpm
-                )
-                response = await router.acompletion(**params)
+            # Pacing and the concurrency semaphore are acquired per attempt and
+            # released before any retry backoff, so a waiting request never
+            # holds a slot that a healthy one could use.
+            if limiter is not None:
+                await limiter.acquire(estimated_tokens)
+            if semaphore is not None:
+                async with semaphore:
+                    response = await litellm.acompletion(**params)
             else:
                 response = await litellm.acompletion(**params)
             raw_response = response
@@ -826,15 +886,20 @@ class LLMClient:
 
             return message.content  # type: ignore[return-value]
 
-        # Apply rate limiting if configured
-        semaphore = await RateLimitPool.get_instance().get_semaphore(
-            model, self.config.max_parallel_requests
-        )
-        if semaphore is not None:
-            async with semaphore:
-                response_content = await _call()
-        else:
+        _call = self._get_retry_decorator()(_attempt)
+
+        # The breaker counts whole requests, not attempts: a call that exhausts
+        # its retries is one infrastructure failure, not max_retries of them.
+        if health is not None:
+            await health.before_request()
+        try:
             response_content = await _call()
+        except BaseException as exc:
+            if health is not None:
+                health.record_failure(exc)
+            raise
+        if health is not None:
+            health.record_success()
 
         # Extract usage and cost from the raw response
         usage = _extract_usage_from_response(raw_response)
@@ -883,6 +948,62 @@ class LLMClient:
             logger.debug(f"Cached response for {cache_key[:8]}...")
 
         return result
+
+    async def generate_many(
+        self,
+        requests: Sequence[GenerateRequest],
+        max_concurrent: int | None = None,
+        **kwargs: Any,
+    ) -> list[GenerateOutcome]:
+        """Generate for many prompts, isolating per-request failures.
+
+        Gives batch generation the contract grading already has: one bad
+        request yields a result carrying an `error` rather than taking its
+        siblings down with it. Pacing, retries, and concurrency are handled by
+        `generate`, so callers need no asyncio of their own.
+
+        Concurrency is bounded by `max_concurrent` when given; otherwise the
+        whole batch is submitted and the rate limiter and
+        `config.max_parallel_requests` decide how fast it actually flows.
+
+        Args:
+            requests: Prompts to generate for. Order is preserved in the result.
+            max_concurrent: Optional ceiling on simultaneously in-flight requests.
+            **kwargs: Forwarded to `generate` for every request.
+
+        Returns:
+            One `GenerateOutcome` per input, in input order.
+
+        Raises:
+            BackendUnavailableError: If the backend circuit breaker trips. This
+                is a property of the run, not of any one request, so it
+                propagates instead of being recorded per item.
+        """
+        semaphore = asyncio.Semaphore(max_concurrent) if max_concurrent else None
+
+        async def _one(index: int, request: GenerateRequest) -> GenerateOutcome:
+            try:
+                if semaphore is not None:
+                    async with semaphore:
+                        content = await self.generate(
+                            request.system_prompt, request.user_prompt, **kwargs
+                        )
+                else:
+                    content = await self.generate(
+                        request.system_prompt, request.user_prompt, **kwargs
+                    )
+            except BackendUnavailableError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    f"Request {index} failed [{classify_grading_error(exc)}]: {exc}"
+                )
+                return GenerateOutcome(index=index, content=None, error=str(exc))
+            return GenerateOutcome(index=index, content=content, error=None)
+
+        return list(
+            await asyncio.gather(*(_one(i, r) for i, r in enumerate(requests)))
+        )
 
     def clear_cache(self) -> int:
         """Clear all cached responses.
