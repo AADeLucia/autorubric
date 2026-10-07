@@ -90,6 +90,20 @@ def _json_decode_error() -> ValueError:
     raise AssertionError("json.loads('{') should have raised")
 
 
+def _none_content_type_error() -> TypeError:
+    """The real exception from parsing a judge response whose ``content`` is ``None``.
+
+    Raised for real on 2026-10-07 by a Qwen3.5-27B judge. Built by actually calling
+    ``json.loads(None)`` rather than constructing a ``TypeError`` by hand, so this
+    test keeps tracking the stdlib's behaviour rather than an assumption about it.
+    """
+    try:
+        json.loads(None)  # type: ignore[arg-type]
+    except TypeError as e:
+        return e
+    raise AssertionError("json.loads(None) should have raised")
+
+
 def _validation_error() -> ValidationError:
     """A real pydantic ``ValidationError``."""
 
@@ -114,6 +128,10 @@ class TestClassifyGradingError:
             (_json_decode_error(), "parse"),  # json.JSONDecodeError subclasses ValueError
             (_validation_error(), "parse"),
             (ValueError("bad value"), "parse"),
+            # A response with no content at all is still the judge failing to produce
+            # parseable output; json.loads(None) raises TypeError, not ValueError.
+            (_none_content_type_error(), "parse"),
+            (TypeError("not a str, bytes or bytearray"), "parse"),
             (RuntimeError("boom"), "unknown"),
         ],
         ids=[
@@ -122,11 +140,24 @@ class TestClassifyGradingError:
             "json_decode_error",
             "pydantic_validation_error",
             "value_error",
+            "none_content_type_error",
+            "type_error",
             "runtime_error",
         ],
     )
     def test_taxonomy(self, exc: BaseException, expected: ErrorCategory):
         assert classify_grading_error(exc) == expected
+
+    def test_none_content_is_not_scored_as_unknown(self):
+        """Regression guard for the 2026-10-07 scoring corruption.
+
+        This is not a naming preference. ``criterion_grader`` routes "parse" to
+        CANNOT_ASSESS (excluded from scoring) but gives "unknown" a worst-case
+        verdict that *is* scored, so classifying a contentless response as unknown
+        silently drove real scores: MET on every negative-weight criterion, UNMET
+        on every positive-weight one.
+        """
+        assert classify_grading_error(_none_content_type_error()) != "unknown"
 
 
 # =============================================================================
@@ -226,6 +257,41 @@ async def test_binary_parse_failure_cannot_assess(mock_llm_config):
     assert cr.is_error
     assert cr.error is not None
     assert cr.error.startswith("parse:")
+
+
+@pytest.mark.asyncio
+async def test_binary_none_content_failure_cannot_assess_and_does_not_score(mock_llm_config):
+    """A judge response with no content must not produce a scored verdict.
+
+    Reproduces the 2026-10-07 Qwen3.5-27B failure end to end. Before TypeError was
+    moved into the parse branch, this landed on the worst-case path: the negative-
+    weight criterion scored MET and subtracted its full penalty, the positive-weight
+    one scored UNMET, and nothing in the record distinguished either from a real
+    judgment. Asserting the score against a clean baseline is the point -- the
+    verdicts alone would not have caught it.
+    """
+    rubric = Rubric(
+        [
+            Criterion(weight=2.0, requirement="Positive criterion"),
+            Criterion(weight=-9.0, requirement="Negative criterion"),
+        ]
+    )
+    with patch(
+        "autorubric.graders.criterion_grader.LLMClient",
+        return_value=_client_raising(_none_content_type_error()),
+    ):
+        grader = CriterionGrader(llm_config=mock_llm_config)
+        report = await rubric.grade("submission", grader=grader)
+
+    assert report.report is not None
+    for cr in report.report:
+        assert cr.final_verdict == CriterionVerdict.CANNOT_ASSESS
+        assert cr.is_error
+        assert cr.error is not None
+        assert cr.error.startswith("parse:")
+
+    # The negative-weight penalty must not have been applied.
+    assert report.raw_score == pytest.approx(0.0)
 
 
 @pytest.mark.asyncio
