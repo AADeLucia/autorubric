@@ -633,3 +633,28 @@ class TestProviderResponseFormat:
         assert isinstance(result, CriterionJudgment)
         assert result.criterion_status.value == "MET"
         assert result.reasoning is None
+
+
+class TestLitellmBanner:
+    """litellm's "Give Feedback" banner must not reach stdout."""
+
+    def test_failed_call_prints_no_banner(self, capsys):
+        import litellm
+
+        import autorubric.llm  # noqa: F401  (import sets the flag)
+
+        # Bare acompletion() against a closed port: the path the Router fix in
+        # litellm never covered, and the one self-hosted judges take.
+        with pytest.raises(Exception):
+            asyncio.run(
+                litellm.acompletion(
+                    model="hosted_vllm/test-model",
+                    api_base="http://127.0.0.1:9/v1",
+                    api_key="EMPTY",
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_retries=0,
+                    timeout=5,
+                )
+            )
+
+        assert "Give Feedback" not in capsys.readouterr().out

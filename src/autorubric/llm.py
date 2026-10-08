@@ -49,6 +49,14 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# litellm print()s a "Give Feedback / Get Help" banner every time it maps an
+# exception -- including each transient error that the retry decorator below
+# then absorbs. It is a bare print, so no logger level silences it, and it
+# carries no error text. litellm.Router sets this flag itself, but the bare
+# acompletion() path (no rpm/tpm configured) never did, which is why
+# self-hosted judges flooded their logs with thousands of these.
+litellm.suppress_debug_info = True
+
 # Type variable for structured output
 T = TypeVar("T", bound=BaseModel)
 
